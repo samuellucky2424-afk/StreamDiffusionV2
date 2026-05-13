@@ -18,6 +18,7 @@ from fastapi import File, HTTPException, UploadFile, WebSocket, WebSocketDisconn
 from .semantic_adapter import MAX_UPLOAD_BYTES, SUPPORTED_CONTENT_TYPES, SemanticAvatarAdapter
 from .semantic_metrics import SemanticAvatarMetrics
 from .semantic_renderer import PipelineQueueSemanticRenderer, latest_frame_payload
+from .video_ws import VideoAvatarRouteConfig, attach_video_avatar_routes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +67,21 @@ def attach_semantic_avatar_routes(
         max_output_frames_per_tick=config.max_output_frames_per_tick,
         image_format=config.image_format,
         image_quality=config.jpeg_quality,
+    )
+    app.state.video_avatar_renderer = attach_video_avatar_routes(
+        app,
+        pipeline=pipeline,
+        width=width,
+        height=height,
+        route_config=VideoAvatarRouteConfig(
+            target_fps=config.target_fps,
+            jpeg_quality=config.jpeg_quality,
+            max_input_queue_frames=config.max_input_queue_frames,
+            max_output_frames_per_tick=config.max_output_frames_per_tick,
+            image_format=config.image_format,
+            metrics_interval_s=config.metrics_interval_s,
+            default_prompt=config.default_prompt,
+        ),
     )
 
     @app.get("/semantic-avatar/health")

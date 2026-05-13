@@ -11,6 +11,7 @@ from .semantic_mouth_conditioner import MouthFeatures, SemanticMouthConditioner
 from .semantic_pose import SemanticPacket
 from .semantic_renderer import PipelineQueueSemanticRenderer
 from .semantic_ws import SemanticAvatarRouteConfig, attach_semantic_avatar_routes
+from .video_ws import VideoAvatarRouteConfig, VideoFrameStreamRenderer, attach_video_avatar_routes
 
 __all__ = [
     "LegacySemanticPacket",
@@ -30,5 +31,8 @@ __all__ = [
     "SemanticAvatarRouteConfig",
     "SemanticPacket",
     "SemanticPoseConditioningAdapter",
+    "VideoAvatarRouteConfig",
+    "VideoFrameStreamRenderer",
     "attach_semantic_avatar_routes",
+    "attach_video_avatar_routes",
 ]
