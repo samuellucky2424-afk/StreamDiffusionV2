@@ -2,7 +2,8 @@
 set -eu
 
 # Build the Svelte frontend, then launch the Python demo backend.
-# Override HOST, PORT, GPU_IDS, STEP, and MODEL_TYPE via environment variables.
+# Override HOST, PORT, GPU_IDS, STEP, MODEL_TYPE, CONDITIONING_SOURCE,
+# and SEMANTIC_AVATAR_* via environment variables.
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 FRONTEND_DIR="$SCRIPT_DIR/frontend"
 
@@ -14,6 +15,11 @@ MODEL_TYPE="${MODEL_TYPE:-T2V-1.3B}"
 USE_TAEHV="${USE_TAEHV:-0}"
 USE_TENSORRT="${USE_TENSORRT:-0}"
 FAST="${FAST:-0}"
+CONDITIONING_SOURCE="${CONDITIONING_SOURCE:-rgb}"
+SEMANTIC_AVATAR_TARGET_FPS="${SEMANTIC_AVATAR_TARGET_FPS:-8}"
+SEMANTIC_AVATAR_JPEG_QUALITY="${SEMANTIC_AVATAR_JPEG_QUALITY:-68}"
+SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES="${SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES:-16}"
+SEMANTIC_AVATAR_IMAGE_FORMAT="${SEMANTIC_AVATAR_IMAGE_FORMAT:-JPEG}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 LOCAL_GPU_IDS="$(seq 0 $((${#GPU_ARRAY[@]} - 1)) | paste -sd, -)"
@@ -52,6 +58,11 @@ CUDA_VISIBLE_DEVICES="$GPU_IDS" python main.py \
   --gpu_ids "$LOCAL_GPU_IDS" \
   --step "$STEP" \
   --model_type "$MODEL_TYPE" \
+  --conditioning_source "$CONDITIONING_SOURCE" \
+  --semantic-avatar-target-fps "$SEMANTIC_AVATAR_TARGET_FPS" \
+  --semantic-avatar-jpeg-quality "$SEMANTIC_AVATAR_JPEG_QUALITY" \
+  --semantic-avatar-max-input-queue-frames "$SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES" \
+  --semantic-avatar-image-format "$SEMANTIC_AVATAR_IMAGE_FORMAT" \
   $TAEHV_FLAG \
   $TENSORRT_FLAG \
   $FAST_FLAG

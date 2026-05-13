@@ -5,7 +5,7 @@ import queue
 import time
 import traceback
 from multiprocessing import Queue, Manager, Event, Process
-from typing import Literal
+from typing import Any, Dict, Literal, Optional
 
 DEMO_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(DEMO_ROOT)
@@ -27,12 +27,34 @@ import torch
 from pydantic import BaseModel, Field
 from PIL import Image
 from typing import List
+from semantic_avatar import SemanticPoseConditioningAdapter
 from streamv2v.inference import SingleGPUInferencePipeline as StreamBatchInferencePipeline
 from streamv2v.inference_wo_batch import SingleGPUInferencePipeline as StreamNoBatchInferencePipeline
 from streamv2v.inference_common import merge_cli_config
 
 LOGGER = logging.getLogger(__name__)
 STARTUP_TIMEOUT_SECONDS = 180.0
+SEMANTIC_PACKET_KEYS = {
+    "t",
+    "timestamp",
+    "frameId",
+    "frame_id",
+    "yaw",
+    "pitch",
+    "roll",
+    "headX",
+    "head_x",
+    "headY",
+    "head_y",
+    "shoulderX",
+    "shoulder_x",
+    "shoulderY",
+    "shoulder_y",
+    "confidence",
+    "poseLandmarks",
+    "pose_landmarks",
+    "landmarks",
+}
 
 default_prompt = "Cyberpunk-inspired figure, neon-lit hair highlights, augmented cybernetic facial features, glowing interface holograms floating around, futuristic cityscape reflected in eyes, vibrant neon color palette, cinematic sci-fi style"
 
@@ -87,7 +109,7 @@ class Pipeline:
         page_content: str = page_content
 
     class InputParams(BaseModel):
-        model_config = {"arbitrary_types_allowed": True}
+        model_config = {"arbitrary_types_allowed": True, "extra": "allow"}
         
         prompt: str = Field(
             default_prompt,
@@ -134,6 +156,12 @@ class Pipeline:
             hide=True,
             id="use_tensorrt",
         )
+        semantic_packet: Optional[Dict[str, Any]] = Field(
+            default=None,
+            title="Semantic Packet",
+            hide=True,
+            id="semantic_packet",
+        )
 
     def __init__(self, args):
         torch.set_grad_enabled(False)
@@ -147,6 +175,18 @@ class Pipeline:
 
         self.prompt = params.prompt
         self.args = config
+        self.conditioning_source = str(getattr(config, "conditioning_source", "rgb"))
+        self.semantic_adapter = None
+        if self.conditioning_source == "semantic_pose":
+            self.semantic_adapter = SemanticPoseConditioningAdapter.from_env(
+                width=int(config["width"]),
+                height=int(config["height"]),
+            )
+            LOGGER.info(
+                "Semantic pose conditioning enabled: width=%s height=%s",
+                config["width"],
+                config["height"],
+            )
         self.prepare()
 
     def prepare(self):
@@ -183,7 +223,16 @@ class Pipeline:
         )
 
     def accept_new_params(self, params: "Pipeline.InputParams"):
-        if hasattr(params, "image"):
+        if self.conditioning_source == "semantic_pose":
+            packet = self._extract_semantic_packet(params)
+            if packet is None:
+                LOGGER.debug("semantic_pose conditioning selected but no semantic packet was provided")
+            else:
+                image_array = self.semantic_adapter.packet_to_array(packet)
+                self.input_queue.put(image_array)
+                if self.semantic_adapter.frames_rendered % 120 == 0:
+                    LOGGER.info("Semantic pose adapter metrics: %s", self.semantic_adapter.metrics())
+        elif hasattr(params, "image"):
             image_array = image_to_array(params.image, self.args.width, self.args.height)
             self.input_queue.put(image_array)
 
@@ -214,6 +263,16 @@ class Pipeline:
         from types import SimpleNamespace
 
         return SimpleNamespace(**dump_pydantic_model(params))
+
+    @staticmethod
+    def _extract_semantic_packet(params: "Pipeline.InputParams") -> dict | None:
+        packet = getattr(params, "semantic_packet", None)
+        if packet:
+            return packet
+
+        data = dump_pydantic_model(params) if hasattr(params, "model_dump") or hasattr(params, "dict") else vars(params)
+        packet = {key: data[key] for key in SEMANTIC_PACKET_KEYS if key in data}
+        return packet or None
 
     def produce_outputs(self) -> List[Image.Image]:
         qsize = self.output_queue.qsize()
@@ -277,6 +336,10 @@ def generate_process(args, runtime_state, prepare_event, restart_event, stop_eve
         set_config_value(args, "use_taehv", current_use_taehv)
         set_config_value(args, "use_tensorrt", current_use_tensorrt)
         pipeline_manager, _ = build_single_gpu_pipeline_manager(args, device)
+        pipeline_manager.logger.info(
+            "Online worker conditioning_source=%s",
+            getattr(args, "conditioning_source", "rgb"),
+        )
         chunk_size = pipeline_manager.base_chunk_size * args.num_frame_per_block
         first_batch_num_frames = 1 + chunk_size
         is_running = False

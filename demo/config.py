@@ -23,6 +23,11 @@ class Args(NamedTuple):
     use_taehv: bool
     use_tensorrt: bool
     fast: bool
+    conditioning_source: str
+    semantic_avatar_target_fps: int
+    semantic_avatar_jpeg_quality: int
+    semantic_avatar_max_input_queue_frames: int
+    semantic_avatar_image_format: str
     enable_metrics: bool
     target_latency: float
     t2v: bool
@@ -92,6 +97,40 @@ parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model ty
 parser.add_argument("--use_taehv", action="store_true", default=os.getenv("USE_TAEHV", "").lower() in {"1", "true", "yes", "on"}, help="Use the TAEHV decoder for online inference")
 parser.add_argument("--use_tensorrt", action="store_true", default=os.getenv("USE_TENSORRT", "").lower() in {"1", "true", "yes", "on"}, help="Enable available TensorRT acceleration paths for online inference")
 parser.add_argument("--fast", action="store_true", default=os.getenv("FAST", "").lower() in {"1", "true", "yes", "on"}, help="Enable the fast path: --use_taehv --use_tensorrt")
+parser.add_argument(
+    "--conditioning_source",
+    choices=("rgb", "semantic_pose"),
+    default=os.getenv("CONDITIONING_SOURCE", "rgb"),
+    help="Input conditioning source. 'rgb' preserves upstream video behavior; 'semantic_pose' renders server-side pose maps from semantic packets.",
+)
+parser.add_argument(
+    "--semantic-avatar-target-fps",
+    dest="semantic_avatar_target_fps",
+    type=int,
+    default=int(os.getenv("SEMANTIC_AVATAR_TARGET_FPS", "8")),
+    help="Target websocket output cadence for /ws/semantic-avatar.",
+)
+parser.add_argument(
+    "--semantic-avatar-jpeg-quality",
+    dest="semantic_avatar_jpeg_quality",
+    type=int,
+    default=int(os.getenv("SEMANTIC_AVATAR_JPEG_QUALITY", "68")),
+    help="JPEG/WebP quality for semantic avatar websocket frames.",
+)
+parser.add_argument(
+    "--semantic-avatar-max-input-queue-frames",
+    dest="semantic_avatar_max_input_queue_frames",
+    type=int,
+    default=int(os.getenv("SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES", "16")),
+    help="Maximum queued synthetic driving frames before stale frames are dropped.",
+)
+parser.add_argument(
+    "--semantic-avatar-image-format",
+    dest="semantic_avatar_image_format",
+    choices=("JPEG", "WEBP"),
+    default=os.getenv("SEMANTIC_AVATAR_IMAGE_FORMAT", "JPEG").upper(),
+    help="Binary websocket frame image format.",
+)
 
 # Metrics collection
 parser.add_argument("--enable-metrics", dest="enable_metrics", action="store_true", default=False, help="Enable SLO metrics collection")

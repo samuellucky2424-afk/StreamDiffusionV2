@@ -176,6 +176,10 @@ class SingleGPUInferencePipeline:
         noise = torch.randn_like(latents)
         return noise * noise_scale + latents * (1 - noise_scale)
 
+    def _prepare_conditioning_images(self, images: torch.Tensor) -> torch.Tensor:
+        """Return stream-compatible conditioning frames before VAE encoding."""
+        return images
+
     def _decode_video_array(self, denoised_pred: torch.Tensor, last_frame_only: bool = False) -> np.ndarray:
         if last_frame_only:
             denoised_pred = denoised_pred[[-1]]
@@ -193,6 +197,7 @@ class SingleGPUInferencePipeline:
         current_start = 0
         current_end = self.pipeline.frame_seq_length * (1 + chunk_size // self.base_chunk_size)
 
+        images = self._prepare_conditioning_images(images)
         noisy_latents = self._encode_noisy_latents(images, noise_scale)
         denoised_pred = self.prepare_pipeline(
             text_prompts=[prompt],
@@ -216,6 +221,7 @@ class SingleGPUInferencePipeline:
 
     def run_stream_batch(self, session: SingleGPUStreamSession, images: torch.Tensor) -> List[np.ndarray]:
         """Process one or more chunk-aligned frame groups for an active streaming session."""
+        images = self._prepare_conditioning_images(images)
         num_frames = images.shape[2]
         input_batch = num_frames // session.chunk_size
         noise_scale, current_step = compute_noise_scale_and_step(

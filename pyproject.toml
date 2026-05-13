@@ -37,6 +37,7 @@ dependencies = [
   "omegaconf==2.3.0",
   "Pillow==10.1.0",
   "pydantic==2.10.6",
+  "python-multipart==0.0.9",
   "regex==2024.11.6",
   "scikit-image==0.25.2",
   "sentencepiece==0.2.0",
@@ -66,7 +67,7 @@ streamdiffusionv2-pipe = "streamv2v.inference_pipe:main"
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["models*", "streamv2v*", "streamdiffusionv2*"]
+include = ["models*", "semantic_avatar*", "streamv2v*", "streamdiffusionv2*"]
 
 [tool.setuptools.package-data]
 "streamv2v.configs" = ["*.yaml"]

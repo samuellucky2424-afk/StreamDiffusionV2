@@ -22,12 +22,49 @@ from collections import deque
 from config import config, Args
 from util import pil_to_frame, bytes_to_pil, is_firefox
 from connection_manager import ConnectionManager, ServerFullException
+from semantic_avatar.semantic_ws import SemanticAvatarRouteConfig, attach_semantic_avatar_routes
 
 # fix mime error on windows
 mimetypes.add_type("application/javascript", ".js")
 
 THROTTLE = 1.0 / 120
 LOGGER = logging.getLogger(__name__)
+SEMANTIC_PACKET_KEYS = {
+    "t",
+    "timestamp",
+    "frameId",
+    "frame_id",
+    "yaw",
+    "pitch",
+    "roll",
+    "headX",
+    "head_x",
+    "headY",
+    "head_y",
+    "shoulderX",
+    "shoulder_x",
+    "shoulderY",
+    "shoulder_y",
+    "confidence",
+    "poseLandmarks",
+    "pose_landmarks",
+    "landmarks",
+}
+
+
+def is_semantic_pose_pipeline(pipeline) -> bool:
+    return str(getattr(pipeline, "conditioning_source", "rgb")) == "semantic_pose"
+
+
+def normalize_semantic_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict) or payload.get("semantic_packet"):
+        return payload
+
+    packet = {key: payload[key] for key in SEMANTIC_PACKET_KEYS if key in payload}
+    if packet:
+        payload = dict(payload)
+        payload["semantic_packet"] = packet
+    return payload
 
 
 class App:
@@ -45,6 +82,7 @@ class App:
         self.target_latency = config.target_latency  # Target latency in seconds for deadline miss rate
         self.step = config.step  # Pipeline step parameter
         self.gpu_ids = config.gpu_ids  # GPU IDs (e.g., "0,1" or "0")
+        self.semantic_avatar_renderer = None
         if self.enable_metrics:
             # Simple timestamp queue for input frames (FIFO)
             self.user_input_timestamps = {}  # user_id -> deque of input timestamps
@@ -64,6 +102,20 @@ class App:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+        )
+
+        self.semantic_avatar_renderer = attach_semantic_avatar_routes(
+            self.app,
+            pipeline=self.pipeline,
+            width=int(getattr(getattr(self.pipeline, "args", None), "width", 512)),
+            height=int(getattr(getattr(self.pipeline, "args", None), "height", 512)),
+            route_config=SemanticAvatarRouteConfig(
+                target_fps=int(self.args.semantic_avatar_target_fps),
+                jpeg_quality=int(self.args.semantic_avatar_jpeg_quality),
+                max_input_queue_frames=int(self.args.semantic_avatar_max_input_queue_frames),
+                image_format=str(self.args.semantic_avatar_image_format),
+                default_prompt=getattr(self.pipeline, "prompt", None),
+            ),
         )
 
         @self.app.websocket("/api/ws/{user_id}")
@@ -133,8 +185,10 @@ class App:
                         await asyncio.sleep(THROTTLE)
                         continue
 
-                    params = await self.conn_manager.receive_json(user_id)
-                    params = self.pipeline.InputParams(**params)
+                    params_payload = await self.conn_manager.receive_json(user_id)
+                    if is_semantic_pose_pipeline(self.pipeline):
+                        params_payload = normalize_semantic_payload(params_payload)
+                    params = self.pipeline.InputParams(**params_payload)
                     info = self.pipeline.Info()
                     params = self.pipeline.params_to_namespace(params)
                     
@@ -144,7 +198,7 @@ class App:
                     if is_upload_mode:
                         LOGGER.debug("Upload mode detected for user %s", user_id)
                     
-                    if info.input_mode == "image":
+                    if info.input_mode == "image" and not is_semantic_pose_pipeline(self.pipeline):
                         upload_completed = self.conn_manager.is_video_upload_completed(user_id)
                         # Only receive image bytes if not in upload mode, or upload not completed yet
                         if (not is_upload_mode) or (is_upload_mode and not upload_completed):
