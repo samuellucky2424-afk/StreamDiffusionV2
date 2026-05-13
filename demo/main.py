@@ -19,6 +19,11 @@ import signal
 import sys
 from collections import deque
 
+DEMO_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(DEMO_ROOT)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from config import config, Args
 from util import pil_to_frame, bytes_to_pil, is_firefox
 from connection_manager import ConnectionManager, ServerFullException
@@ -75,7 +80,7 @@ class App:
         self.conn_manager = ConnectionManager()
         self.prediction_workers = {}
         self.shutdown_event = asyncio.Event()
-        self.demo_root = os.path.dirname(os.path.abspath(__file__))
+        self.demo_root = DEMO_ROOT
         self.frontend_public_dir = os.path.join(self.demo_root, "frontend", "public")
         # Initialize metrics collection only if enabled
         self.enable_metrics = config.enable_metrics
