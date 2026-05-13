@@ -18,7 +18,7 @@ from time import perf_counter, time
 from typing import Any, Mapping
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
 from .semantic_face_encoder import FacialConditioning, SemanticFaceEncoder
 from .semantic_pose import SemanticPacket
@@ -73,6 +73,7 @@ class SemanticAvatarAdapter:
         *,
         debug_dir: str | os.PathLike[str] | None = None,
         debug_every_n: int = 0,
+        debug_semantic_overlay: bool = False,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -83,18 +84,33 @@ class SemanticAvatarAdapter:
         self.last_render_ms = 0.0
         self.face_encoder = SemanticFaceEncoder()
         self.last_conditioning_metrics: dict[str, Any] = {}
+        self.debug_semantic_overlay = bool(debug_semantic_overlay)
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.debug_every_n = max(0, int(debug_every_n))
         if self.debug_dir:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def from_env(cls, width: int = 512, height: int = 512) -> "SemanticAvatarAdapter":
+    def from_env(
+        cls,
+        width: int = 512,
+        height: int = 512,
+        *,
+        debug_semantic_overlay: bool | None = None,
+    ) -> "SemanticAvatarAdapter":
+        if debug_semantic_overlay is None:
+            debug_semantic_overlay = os.getenv("SEMANTIC_AVATAR_DEBUG_OVERLAY", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         return cls(
             width=width,
             height=height,
             debug_dir=os.getenv("SEMANTIC_AVATAR_DEBUG_DIR"),
             debug_every_n=int(os.getenv("SEMANTIC_AVATAR_DEBUG_EVERY_N", "0") or "0"),
+            debug_semantic_overlay=debug_semantic_overlay,
         )
 
     def upload_portrait(self, filename: str, payload: bytes) -> dict[str, Any]:
@@ -171,7 +187,7 @@ class SemanticAvatarAdapter:
         self.last_conditioning_metrics = dict(conditioning.metrics)
         control = conditioning.control
 
-        base = session.image
+        base = self._deform_portrait(session.image, packet, control)
         background = base.filter(ImageFilter.GaussianBlur(radius=14))
         background = Image.blend(background, Image.new("RGB", base.size, (20, 22, 28)), 0.34)
 
@@ -195,9 +211,176 @@ class SemanticAvatarAdapter:
 
         frame = background.convert("RGBA")
         frame.alpha_composite(layer, (x, y))
-        self._composite_conditioning_maps(frame, conditioning, control)
-        self._draw_expression_overlay(frame, packet, control)
+        if self.debug_semantic_overlay:
+            self._composite_conditioning_maps(frame, conditioning, control)
+            self._draw_expression_overlay(frame, packet, control)
         return frame.convert("RGB")
+
+    def _deform_portrait(self, image: Image.Image, packet: SemanticPacket, control: dict[str, Any]) -> Image.Image:
+        """Apply natural-looking portrait deformations before VAE encoding.
+
+        This is the hidden semantic-to-image-conditioning stage. It avoids
+        painting landmark/mask graphics while still giving StreamDiffusionV2 a
+        changing visual condition to denoise from.
+        """
+
+        frame = image.convert("RGBA")
+        width, height = frame.size
+        cx = width * 0.5 + (control["head_x"] - 0.5) * width * 0.035
+        face_cy = height * 0.42 + (control["head_y"] - 0.35) * height * 0.035
+        face_w = width * 0.38
+        face_h = height * 0.46
+
+        self._shift_brow_regions(frame, cx, face_cy, face_w, face_h, control)
+        self._deform_eye_region(frame, cx - face_w * 0.22, face_cy - face_h * 0.17, face_w, face_h, control["blink_left"], control)
+        self._deform_eye_region(frame, cx + face_w * 0.22, face_cy - face_h * 0.17, face_w, face_h, control["blink_right"], control)
+        self._deform_mouth_region(frame, cx, face_cy + face_h * 0.22, face_w, face_h, packet, control)
+        return frame.convert("RGB")
+
+    def _deform_mouth_region(
+        self,
+        frame: Image.Image,
+        cx: float,
+        cy: float,
+        face_w: float,
+        face_h: float,
+        packet: SemanticPacket,
+        control: dict[str, Any],
+    ) -> None:
+        mouth_open = _clamp(control["mouth_open"], 0.0, 1.0)
+        jaw_open = _clamp(control["jaw_open"], 0.0, 1.0)
+        smile = _clamp(control["smile"], 0.0, 1.0)
+        lip_width = _clamp(control["lip_width"], 0.0, 1.0)
+        width, height = frame.size
+        region_w = max(12, int(face_w * (0.34 + lip_width * 0.22 + smile * 0.16)))
+        region_h = max(10, int(face_h * (0.105 + jaw_open * 0.10)))
+        bbox = self._safe_box(cx - region_w * 0.5, cy - region_h * 0.5, cx + region_w * 0.5, cy + region_h * 0.5, width, height)
+        if bbox is None:
+            return
+
+        crop = frame.crop(bbox)
+        crop_w, crop_h = crop.size
+        scale_x = 1.0 + smile * 0.16 + lip_width * 0.08
+        scale_y = 0.92 + mouth_open * 0.70
+        resized = crop.resize(
+            (max(1, int(crop_w * scale_x)), max(1, int(crop_h * scale_y))),
+            Image.Resampling.BICUBIC,
+        )
+        paste_x = int((bbox[0] + bbox[2] - resized.width) * 0.5)
+        paste_y = int((bbox[1] + bbox[3] - resized.height) * 0.5 + jaw_open * height * 0.008)
+        mask = Image.new("L", resized.size, 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, resized.width, resized.height], fill=205)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=max(2, crop_w // 18)))
+        resized.putalpha(mask)
+        self._alpha_composite_clipped(frame, resized, paste_x, paste_y)
+
+        if mouth_open > 0.08:
+            # Darken the existing mouth region instead of drawing a semantic graphic.
+            aperture = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(aperture, "RGBA")
+            hole_w = face_w * (0.075 + lip_width * 0.035 + smile * 0.025)
+            hole_h = face_h * (0.010 + mouth_open * 0.060 + jaw_open * 0.035)
+            mouth_color = self._sample_dark_color(frame, bbox)
+            draw.ellipse(
+                [cx - hole_w, cy - hole_h, cx + hole_w, cy + hole_h],
+                fill=(*mouth_color, int(42 + mouth_open * 86)),
+            )
+            aperture = aperture.filter(ImageFilter.GaussianBlur(radius=max(1.0, width / 360.0)))
+            frame.alpha_composite(aperture)
+
+    def _deform_eye_region(
+        self,
+        frame: Image.Image,
+        cx: float,
+        cy: float,
+        face_w: float,
+        face_h: float,
+        blink: float,
+        control: dict[str, Any],
+    ) -> None:
+        blink = _clamp(blink, 0.0, 1.0)
+        width, height = frame.size
+        region_w = max(10, int(face_w * 0.20))
+        region_h = max(8, int(face_h * 0.075))
+        gaze_x = control["eye_x"] * width * 0.006
+        gaze_y = control["eye_y"] * height * 0.004
+        bbox = self._safe_box(
+            cx - region_w * 0.5 + gaze_x,
+            cy - region_h * 0.5 + gaze_y,
+            cx + region_w * 0.5 + gaze_x,
+            cy + region_h * 0.5 + gaze_y,
+            width,
+            height,
+        )
+        if bbox is None:
+            return
+
+        crop = frame.crop(bbox)
+        crop_w, crop_h = crop.size
+        target_h = max(1, int(crop_h * (1.0 - blink * 0.72)))
+        compressed = crop.resize((crop_w, target_h), Image.Resampling.BICUBIC)
+        eyelid = crop.filter(ImageFilter.GaussianBlur(radius=max(1.0, crop_h / 7.0)))
+        frame.alpha_composite(eyelid, (bbox[0], bbox[1]))
+        frame.alpha_composite(compressed, (bbox[0], int((bbox[1] + bbox[3] - target_h) * 0.5)))
+
+    def _shift_brow_regions(
+        self,
+        frame: Image.Image,
+        cx: float,
+        face_cy: float,
+        face_w: float,
+        face_h: float,
+        control: dict[str, Any],
+    ) -> None:
+        brow = _clamp(control["brow"], 0.0, 1.0)
+        if brow < 0.03:
+            return
+        width, height = frame.size
+        shift = int(-brow * height * 0.018)
+        for side in (-1, 1):
+            bx = cx + side * face_w * 0.22
+            by = face_cy - face_h * 0.30
+            region_w = max(12, int(face_w * 0.22))
+            region_h = max(8, int(face_h * 0.07))
+            bbox = self._safe_box(bx - region_w * 0.5, by - region_h * 0.5, bx + region_w * 0.5, by + region_h * 0.5, width, height)
+            if bbox is None:
+                continue
+            crop = frame.crop(bbox)
+            mask = Image.new("L", crop.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, crop.width, crop.height], radius=max(2, crop.height // 2), fill=170)
+            mask = mask.filter(ImageFilter.GaussianBlur(radius=max(1, crop.height // 4)))
+            frame.paste(crop, (bbox[0], bbox[1] + shift), mask)
+
+    @staticmethod
+    def _safe_box(left: float, top: float, right: float, bottom: float, width: int, height: int) -> tuple[int, int, int, int] | None:
+        box = (
+            max(0, int(left)),
+            max(0, int(top)),
+            min(width, int(right)),
+            min(height, int(bottom)),
+        )
+        if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+            return None
+        return box
+
+    @staticmethod
+    def _alpha_composite_clipped(frame: Image.Image, overlay: Image.Image, x: int, y: int) -> None:
+        left = max(0, -x)
+        top = max(0, -y)
+        right = min(overlay.width, frame.width - x)
+        bottom = min(overlay.height, frame.height - y)
+        if right <= left or bottom <= top:
+            return
+        clipped = overlay.crop((left, top, right, bottom))
+        frame.alpha_composite(clipped, (max(0, x), max(0, y)))
+
+    @staticmethod
+    def _sample_dark_color(frame: Image.Image, bbox: tuple[int, int, int, int]) -> tuple[int, int, int]:
+        crop = frame.crop(bbox).convert("RGB").resize((1, 1), Image.Resampling.BILINEAR)
+        r, g, b = crop.getpixel((0, 0))
+        enhancer = ImageEnhance.Brightness(Image.new("RGB", (1, 1), (r, g, b)))
+        dark = enhancer.enhance(0.36).getpixel((0, 0))
+        return (int(dark[0]), int(dark[1]), int(dark[2]))
 
     def _composite_conditioning_maps(
         self,
@@ -308,6 +491,8 @@ class SemanticAvatarAdapter:
             "semantic_adapter_last_render_ms": round(self.last_render_ms, 3),
             "semantic_adapter_width": self.width,
             "semantic_adapter_height": self.height,
+            "semantic_debug_overlay": self.debug_semantic_overlay,
+            "semantic_conditioning_mode": "debug_overlay" if self.debug_semantic_overlay else "hidden_pre_denoise",
             "avatar_session_count": session_count,
             "active_avatar": active_session.metrics() if active_session else None,
             **self.last_conditioning_metrics,

@@ -31,6 +31,7 @@ class SemanticAvatarRouteConfig:
     image_format: str = "JPEG"
     metrics_interval_s: float = 1.0
     default_prompt: str | None = None
+    debug_semantic_overlay: bool = False
 
 
 def attach_semantic_avatar_routes(
@@ -45,7 +46,11 @@ def attach_semantic_avatar_routes(
 
     config = route_config or SemanticAvatarRouteConfig()
     metrics = SemanticAvatarMetrics()
-    adapter = SemanticAvatarAdapter.from_env(width=width, height=height)
+    adapter = SemanticAvatarAdapter.from_env(
+        width=width,
+        height=height,
+        debug_semantic_overlay=config.debug_semantic_overlay,
+    )
     renderer = PipelineQueueSemanticRenderer(
         pipeline=pipeline,
         adapter=adapter,

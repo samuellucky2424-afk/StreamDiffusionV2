@@ -120,6 +120,7 @@ class App:
                 max_input_queue_frames=int(self.args.semantic_avatar_max_input_queue_frames),
                 image_format=str(self.args.semantic_avatar_image_format),
                 default_prompt=getattr(self.pipeline, "prompt", None),
+                debug_semantic_overlay=bool(self.args.debug_semantic_overlay),
             ),
         )
 

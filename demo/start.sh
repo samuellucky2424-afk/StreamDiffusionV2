@@ -20,6 +20,7 @@ SEMANTIC_AVATAR_TARGET_FPS="${SEMANTIC_AVATAR_TARGET_FPS:-8}"
 SEMANTIC_AVATAR_JPEG_QUALITY="${SEMANTIC_AVATAR_JPEG_QUALITY:-68}"
 SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES="${SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES:-16}"
 SEMANTIC_AVATAR_IMAGE_FORMAT="${SEMANTIC_AVATAR_IMAGE_FORMAT:-JPEG}"
+DEBUG_SEMANTIC_OVERLAY="${DEBUG_SEMANTIC_OVERLAY:-0}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 LOCAL_GPU_IDS="$(seq 0 $((${#GPU_ARRAY[@]} - 1)) | paste -sd, -)"
@@ -51,6 +52,13 @@ case "$(printf '%s' "$FAST" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
+DEBUG_SEMANTIC_OVERLAY_FLAG=""
+case "$(printf '%s' "$DEBUG_SEMANTIC_OVERLAY" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on)
+    DEBUG_SEMANTIC_OVERLAY_FLAG="--debug-semantic-overlay"
+    ;;
+esac
+
 CUDA_VISIBLE_DEVICES="$GPU_IDS" python main.py \
   --port "$PORT" \
   --host "$HOST" \
@@ -63,6 +71,7 @@ CUDA_VISIBLE_DEVICES="$GPU_IDS" python main.py \
   --semantic-avatar-jpeg-quality "$SEMANTIC_AVATAR_JPEG_QUALITY" \
   --semantic-avatar-max-input-queue-frames "$SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES" \
   --semantic-avatar-image-format "$SEMANTIC_AVATAR_IMAGE_FORMAT" \
+  $DEBUG_SEMANTIC_OVERLAY_FLAG \
   $TAEHV_FLAG \
   $TENSORRT_FLAG \
   $FAST_FLAG

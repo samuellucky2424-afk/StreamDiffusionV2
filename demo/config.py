@@ -28,6 +28,7 @@ class Args(NamedTuple):
     semantic_avatar_jpeg_quality: int
     semantic_avatar_max_input_queue_frames: int
     semantic_avatar_image_format: str
+    debug_semantic_overlay: bool
     enable_metrics: bool
     target_latency: float
     t2v: bool
@@ -130,6 +131,13 @@ parser.add_argument(
     choices=("JPEG", "WEBP"),
     default=os.getenv("SEMANTIC_AVATAR_IMAGE_FORMAT", "JPEG").upper(),
     help="Binary websocket frame image format.",
+)
+parser.add_argument(
+    "--debug-semantic-overlay",
+    dest="debug_semantic_overlay",
+    action="store_true",
+    default=os.getenv("DEBUG_SEMANTIC_OVERLAY", "").lower() in {"1", "true", "yes", "on"},
+    help="Render semantic maps visibly in avatar conditioning frames for debugging. Off by default.",
 )
 
 # Metrics collection
