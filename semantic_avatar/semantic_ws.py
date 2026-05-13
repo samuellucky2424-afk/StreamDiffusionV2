@@ -32,6 +32,7 @@ class SemanticAvatarRouteConfig:
     metrics_interval_s: float = 1.0
     default_prompt: str | None = None
     debug_semantic_overlay: bool = False
+    debug_face_mask: bool = False
 
 
 def attach_semantic_avatar_routes(
@@ -50,6 +51,7 @@ def attach_semantic_avatar_routes(
         width=width,
         height=height,
         debug_semantic_overlay=config.debug_semantic_overlay,
+        debug_face_mask=config.debug_face_mask,
     )
     renderer = PipelineQueueSemanticRenderer(
         pipeline=pipeline,

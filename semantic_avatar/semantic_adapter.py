@@ -20,7 +20,16 @@ from typing import Any, Mapping
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
-from .semantic_face_encoder import FacialConditioning, SemanticFaceEncoder
+from .semantic_face_encoder import (
+    FACE_OVAL,
+    LEFT_BROW,
+    LEFT_EYE,
+    MOUTH_OUTER,
+    RIGHT_BROW,
+    RIGHT_EYE,
+    FacialConditioning,
+    SemanticFaceEncoder,
+)
 from .semantic_pose import SemanticPacket
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -74,6 +83,7 @@ class SemanticAvatarAdapter:
         debug_dir: str | os.PathLike[str] | None = None,
         debug_every_n: int = 0,
         debug_semantic_overlay: bool = False,
+        debug_face_mask: bool = False,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -85,6 +95,7 @@ class SemanticAvatarAdapter:
         self.face_encoder = SemanticFaceEncoder()
         self.last_conditioning_metrics: dict[str, Any] = {}
         self.debug_semantic_overlay = bool(debug_semantic_overlay)
+        self.debug_face_mask = bool(debug_face_mask)
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.debug_every_n = max(0, int(debug_every_n))
         if self.debug_dir:
@@ -97,9 +108,17 @@ class SemanticAvatarAdapter:
         height: int = 512,
         *,
         debug_semantic_overlay: bool | None = None,
+        debug_face_mask: bool | None = None,
     ) -> "SemanticAvatarAdapter":
         if debug_semantic_overlay is None:
             debug_semantic_overlay = os.getenv("SEMANTIC_AVATAR_DEBUG_OVERLAY", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if debug_face_mask is None:
+            debug_face_mask = os.getenv("SEMANTIC_AVATAR_DEBUG_FACE_MASK", "").lower() in {
                 "1",
                 "true",
                 "yes",
@@ -111,6 +130,7 @@ class SemanticAvatarAdapter:
             debug_dir=os.getenv("SEMANTIC_AVATAR_DEBUG_DIR"),
             debug_every_n=int(os.getenv("SEMANTIC_AVATAR_DEBUG_EVERY_N", "0") or "0"),
             debug_semantic_overlay=debug_semantic_overlay,
+            debug_face_mask=debug_face_mask,
         )
 
     def upload_portrait(self, filename: str, payload: bytes) -> dict[str, Any]:
@@ -187,33 +207,12 @@ class SemanticAvatarAdapter:
         self.last_conditioning_metrics = dict(conditioning.metrics)
         control = conditioning.control
 
-        base = self._deform_portrait(session.image, packet, control)
-        background = base.filter(ImageFilter.GaussianBlur(radius=14))
-        background = Image.blend(background, Image.new("RGB", base.size, (20, 22, 28)), 0.34)
-
-        yaw = _clamp(control["yaw"], -58.0, 58.0)
-        pitch = _clamp(control["pitch"], -46.0, 46.0)
-        roll = _clamp(control["roll"] + control["neck_rotation"] * 0.10, -54.0, 54.0)
-        confidence_alpha = 0.55 + packet.confidence * 0.45
-
-        layer = base.convert("RGBA")
-        yaw_squash = 1.0 - abs(yaw) / 210.0
-        pitch_scale = 1.0 + abs(pitch) / 310.0
-        scaled_w = max(8, int(self.width * yaw_squash))
-        scaled_h = max(8, int(self.height * pitch_scale))
-        layer = layer.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
-        layer = layer.rotate(roll, resample=Image.Resampling.BICUBIC, expand=True)
-
-        x = int((self.width - layer.width) * 0.5 + yaw * 1.12 + (control["head_x"] - 0.5) * 58)
-        y = int((self.height - layer.height) * 0.5 + pitch * 0.58 + (control["head_y"] - 0.35) * 68)
-        alpha = layer.getchannel("A").point(lambda value: int(value * confidence_alpha))
-        layer.putalpha(alpha)
-
-        frame = background.convert("RGBA")
-        frame.alpha_composite(layer, (x, y))
+        frame = self._deform_portrait(session.image, packet, control).convert("RGBA")
         if self.debug_semantic_overlay:
             self._composite_conditioning_maps(frame, conditioning, control)
             self._draw_expression_overlay(frame, packet, control)
+        if self.debug_face_mask:
+            self._draw_face_mask_debug(frame, conditioning, control)
         return frame.convert("RGB")
 
     def _deform_portrait(self, image: Image.Image, packet: SemanticPacket, control: dict[str, Any]) -> Image.Image:
@@ -231,11 +230,200 @@ class SemanticAvatarAdapter:
         face_w = width * 0.38
         face_h = height * 0.46
 
-        self._shift_brow_regions(frame, cx, face_cy, face_w, face_h, control)
-        self._deform_eye_region(frame, cx - face_w * 0.22, face_cy - face_h * 0.17, face_w, face_h, control["blink_left"], control)
-        self._deform_eye_region(frame, cx + face_w * 0.22, face_cy - face_h * 0.17, face_w, face_h, control["blink_right"], control)
-        self._deform_mouth_region(frame, cx, face_cy + face_h * 0.22, face_w, face_h, packet, control)
+        face_points = self._portrait_face_points(packet, width, height)
+        masks = self._build_region_masks(packet, control, face_points, (width, height), cx, face_cy, face_w, face_h)
+        self.last_conditioning_metrics.update(
+            {
+                "local_face_deform_active": True,
+                "global_transform_disabled": True,
+                "portrait_anchor_locked": True,
+                "latent_conditioning_active": True,
+                "controlnet_conditioning_active": True,
+                "controlnet_model_active": False,
+                "controlnet_maps_active": True,
+                "face_mask_resolution": f"{height}x{width}",
+                "face_mask_regions": ",".join(sorted(masks)),
+            }
+        )
+
+        self._apply_head_structure_deform(frame, masks, control)
+        self._shift_brow_regions(frame, cx, face_cy, face_w, face_h, control, masks=masks)
+        self._deform_eye_region(
+            frame,
+            cx - face_w * 0.22,
+            face_cy - face_h * 0.17,
+            face_w,
+            face_h,
+            control["blink_left"],
+            control,
+            mask=masks.get("left_eye"),
+        )
+        self._deform_eye_region(
+            frame,
+            cx + face_w * 0.22,
+            face_cy - face_h * 0.17,
+            face_w,
+            face_h,
+            control["blink_right"],
+            control,
+            mask=masks.get("right_eye"),
+        )
+        self._deform_mouth_region(frame, cx, face_cy + face_h * 0.22, face_w, face_h, packet, control, mask=masks.get("mouth"))
+        self._deform_body_regions(frame, masks, control)
         return frame.convert("RGB")
+
+    def _portrait_face_points(
+        self,
+        packet: SemanticPacket,
+        width: int,
+        height: int,
+    ) -> list[tuple[float, float]]:
+        if not packet.face_landmarks or len(packet.face_landmarks) <= max(FACE_OVAL):
+            return []
+
+        source_points = [(x * width, y * height) for x, y in packet.face_landmarks]
+        face_path = [source_points[index] for index in FACE_OVAL if index < len(source_points)]
+        if not face_path:
+            return []
+
+        left = min(point[0] for point in face_path)
+        right = max(point[0] for point in face_path)
+        top = min(point[1] for point in face_path)
+        bottom = max(point[1] for point in face_path)
+        source_w = max(1.0, right - left)
+        source_h = max(1.0, bottom - top)
+        source_cx = (left + right) * 0.5
+        source_cy = (top + bottom) * 0.5
+
+        target_cx = width * 0.5
+        target_cy = height * 0.43
+        target_w = width * 0.42
+        target_h = height * 0.54
+        scale = min(target_w / source_w, target_h / source_h)
+
+        return [
+            (
+                target_cx + (point[0] - source_cx) * scale,
+                target_cy + (point[1] - source_cy) * scale,
+            )
+            for point in source_points
+        ]
+
+    def _build_region_masks(
+        self,
+        packet: SemanticPacket,
+        control: dict[str, Any],
+        face_points: list[tuple[float, float]],
+        size: tuple[int, int],
+        cx: float,
+        face_cy: float,
+        face_w: float,
+        face_h: float,
+    ) -> dict[str, Image.Image]:
+        width, height = size
+        masks: dict[str, Image.Image] = {}
+
+        def polygon_mask(indices: list[int], blur: float = 3.0, inflate: int = 0) -> Image.Image | None:
+            if not face_points or max(indices) >= len(face_points):
+                return None
+            mask = Image.new("L", size, 0)
+            points = [face_points[index] for index in indices]
+            if inflate > 0:
+                local_cx = sum(point[0] for point in points) / len(points)
+                local_cy = sum(point[1] for point in points) / len(points)
+                points = [
+                    (
+                        local_cx + (point[0] - local_cx) * (1.0 + inflate / 100.0),
+                        local_cy + (point[1] - local_cy) * (1.0 + inflate / 100.0),
+                    )
+                    for point in points
+                ]
+            draw = ImageDraw.Draw(mask)
+            draw.polygon(points, fill=255)
+            return mask.filter(ImageFilter.GaussianBlur(radius=blur))
+
+        def ellipse_mask(name: str, box: tuple[float, float, float, float], blur: float = 4.0) -> None:
+            mask = Image.new("L", size, 0)
+            ImageDraw.Draw(mask).ellipse(box, fill=255)
+            masks[name] = mask.filter(ImageFilter.GaussianBlur(radius=blur))
+
+        mouth = polygon_mask(MOUTH_OUTER, blur=4.0, inflate=18)
+        left_eye = polygon_mask(LEFT_EYE, blur=3.0, inflate=35)
+        right_eye = polygon_mask(RIGHT_EYE, blur=3.0, inflate=35)
+        left_brow = polygon_mask(LEFT_BROW, blur=5.0, inflate=80)
+        right_brow = polygon_mask(RIGHT_BROW, blur=5.0, inflate=80)
+
+        if mouth:
+            masks["mouth"] = mouth
+        else:
+            ellipse_mask("mouth", (cx - face_w * 0.18, face_cy + face_h * 0.15, cx + face_w * 0.18, face_cy + face_h * 0.32))
+        if left_eye:
+            masks["left_eye"] = left_eye
+        else:
+            ellipse_mask("left_eye", (cx - face_w * 0.34, face_cy - face_h * 0.24, cx - face_w * 0.08, face_cy - face_h * 0.10))
+        if right_eye:
+            masks["right_eye"] = right_eye
+        else:
+            ellipse_mask("right_eye", (cx + face_w * 0.08, face_cy - face_h * 0.24, cx + face_w * 0.34, face_cy - face_h * 0.10))
+        if left_brow:
+            masks["left_brow"] = left_brow
+        else:
+            ellipse_mask("left_brow", (cx - face_w * 0.36, face_cy - face_h * 0.36, cx - face_w * 0.06, face_cy - face_h * 0.23))
+        if right_brow:
+            masks["right_brow"] = right_brow
+        else:
+            ellipse_mask("right_brow", (cx + face_w * 0.06, face_cy - face_h * 0.36, cx + face_w * 0.36, face_cy - face_h * 0.23))
+
+        if face_points and max(FACE_OVAL) < len(face_points):
+            lower_face = [face_points[index] for index in FACE_OVAL if index < len(face_points) and face_points[index][1] > face_cy - face_h * 0.02]
+            if len(lower_face) >= 3:
+                jaw_mask = Image.new("L", size, 0)
+                ImageDraw.Draw(jaw_mask).polygon(lower_face, fill=190)
+                masks["jaw"] = jaw_mask.filter(ImageFilter.GaussianBlur(radius=8))
+        if "jaw" not in masks:
+            ellipse_mask("jaw", (cx - face_w * 0.34, face_cy + face_h * 0.02, cx + face_w * 0.34, face_cy + face_h * 0.47), blur=8)
+
+        ellipse_mask("left_cheek", (cx - face_w * 0.38, face_cy - face_h * 0.02, cx - face_w * 0.02, face_cy + face_h * 0.28), blur=8)
+        ellipse_mask("right_cheek", (cx + face_w * 0.02, face_cy - face_h * 0.02, cx + face_w * 0.38, face_cy + face_h * 0.28), blur=8)
+        ellipse_mask("neck", (cx - face_w * 0.20, face_cy + face_h * 0.34, cx + face_w * 0.20, face_cy + face_h * 0.67), blur=8)
+
+        shoulder_y = control["shoulder_y"] * height
+        shoulder_x = control["shoulder_x"] * width
+        upper_body = Image.new("L", size, 0)
+        body_draw = ImageDraw.Draw(upper_body)
+        body_draw.rounded_rectangle(
+            [
+                shoulder_x - width * 0.30,
+                max(face_cy + face_h * 0.44, shoulder_y - height * 0.08),
+                shoulder_x + width * 0.30,
+                min(height, shoulder_y + height * 0.22),
+            ],
+            radius=max(8, width // 18),
+            fill=150,
+        )
+        masks["upper_body"] = upper_body.filter(ImageFilter.GaussianBlur(radius=10))
+        return masks
+
+    def _apply_head_structure_deform(
+        self,
+        frame: Image.Image,
+        masks: dict[str, Image.Image],
+        control: dict[str, Any],
+    ) -> None:
+        width, height = frame.size
+        yaw = _clamp(control["yaw"] / 64.0, -1.0, 1.0)
+        pitch = _clamp(control["pitch"] / 48.0, -1.0, 1.0)
+        roll = _clamp(control["roll"] / 54.0, -1.0, 1.0)
+        cheek_shift = width * 0.014 * yaw
+        vertical_shift = height * 0.008 * pitch
+
+        self._apply_masked_transform(frame, masks.get("left_cheek"), shift=(-cheek_shift, vertical_shift), scale=(1.0 - yaw * 0.020, 1.0 + pitch * 0.020))
+        self._apply_masked_transform(frame, masks.get("right_cheek"), shift=(-cheek_shift, vertical_shift), scale=(1.0 - yaw * 0.020, 1.0 + pitch * 0.020))
+        self._apply_masked_transform(frame, masks.get("jaw"), shift=(-cheek_shift * 0.45, vertical_shift * 1.35), scale=(1.0 + abs(yaw) * 0.020, 1.0 + pitch * 0.030))
+        self._apply_masked_transform(frame, masks.get("neck"), shift=(-cheek_shift * 0.25 + roll * width * 0.006, vertical_shift * 0.5), scale=(1.0, 1.0 + abs(pitch) * 0.018))
+        self._apply_masked_transform(frame, masks.get("mouth"), shift=(-cheek_shift * 0.30, vertical_shift * 0.65), scale=(1.0 + abs(yaw) * 0.012, 1.0))
+        self._apply_masked_transform(frame, masks.get("left_eye"), shift=(-cheek_shift * 0.18 - roll * width * 0.002, vertical_shift * 0.35), scale=(1.0 - yaw * 0.012, 1.0))
+        self._apply_masked_transform(frame, masks.get("right_eye"), shift=(-cheek_shift * 0.18 + roll * width * 0.002, vertical_shift * 0.35), scale=(1.0 - yaw * 0.012, 1.0))
 
     def _deform_mouth_region(
         self,
@@ -246,6 +434,7 @@ class SemanticAvatarAdapter:
         face_h: float,
         packet: SemanticPacket,
         control: dict[str, Any],
+        mask: Image.Image | None = None,
     ) -> None:
         mouth_open = _clamp(control["mouth_open"], 0.0, 1.0)
         jaw_open = _clamp(control["jaw_open"], 0.0, 1.0)
@@ -254,7 +443,12 @@ class SemanticAvatarAdapter:
         width, height = frame.size
         region_w = max(12, int(face_w * (0.34 + lip_width * 0.22 + smile * 0.16)))
         region_h = max(10, int(face_h * (0.105 + jaw_open * 0.10)))
-        bbox = self._safe_box(cx - region_w * 0.5, cy - region_h * 0.5, cx + region_w * 0.5, cy + region_h * 0.5, width, height)
+        if mask is not None and mask.getbbox() is not None:
+            bbox = mask.getbbox()
+            cx = (bbox[0] + bbox[2]) * 0.5
+            cy = (bbox[1] + bbox[3]) * 0.5
+        else:
+            bbox = self._safe_box(cx - region_w * 0.5, cy - region_h * 0.5, cx + region_w * 0.5, cy + region_h * 0.5, width, height)
         if bbox is None:
             return
 
@@ -268,10 +462,10 @@ class SemanticAvatarAdapter:
         )
         paste_x = int((bbox[0] + bbox[2] - resized.width) * 0.5)
         paste_y = int((bbox[1] + bbox[3] - resized.height) * 0.5 + jaw_open * height * 0.008)
-        mask = Image.new("L", resized.size, 0)
-        ImageDraw.Draw(mask).ellipse([0, 0, resized.width, resized.height], fill=205)
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=max(2, crop_w // 18)))
-        resized.putalpha(mask)
+        alpha = Image.new("L", resized.size, 0)
+        ImageDraw.Draw(alpha).ellipse([0, 0, resized.width, resized.height], fill=205)
+        alpha = alpha.filter(ImageFilter.GaussianBlur(radius=max(2, crop_w // 18)))
+        resized.putalpha(alpha)
         self._alpha_composite_clipped(frame, resized, paste_x, paste_y)
 
         if mouth_open > 0.08:
@@ -297,6 +491,7 @@ class SemanticAvatarAdapter:
         face_h: float,
         blink: float,
         control: dict[str, Any],
+        mask: Image.Image | None = None,
     ) -> None:
         blink = _clamp(blink, 0.0, 1.0)
         width, height = frame.size
@@ -304,14 +499,17 @@ class SemanticAvatarAdapter:
         region_h = max(8, int(face_h * 0.075))
         gaze_x = control["eye_x"] * width * 0.006
         gaze_y = control["eye_y"] * height * 0.004
-        bbox = self._safe_box(
-            cx - region_w * 0.5 + gaze_x,
-            cy - region_h * 0.5 + gaze_y,
-            cx + region_w * 0.5 + gaze_x,
-            cy + region_h * 0.5 + gaze_y,
-            width,
-            height,
-        )
+        if mask is not None and mask.getbbox() is not None:
+            bbox = mask.getbbox()
+        else:
+            bbox = self._safe_box(
+                cx - region_w * 0.5 + gaze_x,
+                cy - region_h * 0.5 + gaze_y,
+                cx + region_w * 0.5 + gaze_x,
+                cy + region_h * 0.5 + gaze_y,
+                width,
+                height,
+            )
         if bbox is None:
             return
 
@@ -331,13 +529,20 @@ class SemanticAvatarAdapter:
         face_w: float,
         face_h: float,
         control: dict[str, Any],
+        masks: dict[str, Image.Image] | None = None,
     ) -> None:
         brow = _clamp(control["brow"], 0.0, 1.0)
         if brow < 0.03:
             return
         width, height = frame.size
         shift = int(-brow * height * 0.018)
-        for side in (-1, 1):
+        for side, mask_name in ((-1, "left_brow"), (1, "right_brow")):
+            mask = masks.get(mask_name) if masks else None
+            if mask is not None and mask.getbbox() is not None:
+                bbox = mask.getbbox()
+                crop = frame.crop(bbox)
+                frame.paste(crop, (bbox[0], bbox[1] + shift), mask.crop(bbox))
+                continue
             bx = cx + side * face_w * 0.22
             by = face_cy - face_h * 0.30
             region_w = max(12, int(face_w * 0.22))
@@ -350,6 +555,75 @@ class SemanticAvatarAdapter:
             ImageDraw.Draw(mask).rounded_rectangle([0, 0, crop.width, crop.height], radius=max(2, crop.height // 2), fill=170)
             mask = mask.filter(ImageFilter.GaussianBlur(radius=max(1, crop.height // 4)))
             frame.paste(crop, (bbox[0], bbox[1] + shift), mask)
+
+    def _deform_body_regions(
+        self,
+        frame: Image.Image,
+        masks: dict[str, Image.Image],
+        control: dict[str, Any],
+    ) -> None:
+        shoulder = _clamp(control["shoulder_rotation"] / 62.0, -1.0, 1.0)
+        neck = _clamp(control["neck_rotation"] / 55.0, -1.0, 1.0)
+        width, height = frame.size
+        self._apply_masked_transform(
+            frame,
+            masks.get("upper_body"),
+            shift=(shoulder * width * 0.010, abs(shoulder) * height * 0.004),
+            scale=(1.0 + abs(shoulder) * 0.015, 1.0),
+        )
+        self._apply_masked_transform(
+            frame,
+            masks.get("neck"),
+            shift=(neck * width * 0.010, 0.0),
+            scale=(1.0 + abs(neck) * 0.012, 1.0),
+        )
+
+    def _apply_masked_transform(
+        self,
+        frame: Image.Image,
+        mask: Image.Image | None,
+        *,
+        shift: tuple[float, float] = (0.0, 0.0),
+        scale: tuple[float, float] = (1.0, 1.0),
+    ) -> None:
+        if mask is None:
+            return
+        bbox = mask.getbbox()
+        if bbox is None:
+            return
+        crop = frame.crop(bbox)
+        crop_mask = mask.crop(bbox)
+        scaled_w = max(1, int(crop.width * max(0.85, min(1.18, scale[0]))))
+        scaled_h = max(1, int(crop.height * max(0.85, min(1.20, scale[1]))))
+        transformed = crop.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
+        transformed_mask = crop_mask.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
+        transformed.putalpha(transformed_mask.point(lambda value: int(value * 0.58)))
+        paste_x = int((bbox[0] + bbox[2] - scaled_w) * 0.5 + shift[0])
+        paste_y = int((bbox[1] + bbox[3] - scaled_h) * 0.5 + shift[1])
+        self._alpha_composite_clipped(frame, transformed, paste_x, paste_y)
+
+    def _draw_face_mask_debug(
+        self,
+        frame: Image.Image,
+        conditioning: FacialConditioning,
+        control: dict[str, Any],
+    ) -> None:
+        overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        for mask, color in (
+            (conditioning.mouth_mask, (255, 64, 96, 86)),
+            (conditioning.eye_mask, (64, 128, 255, 72)),
+            (conditioning.face_map.convert("L"), (64, 255, 210, 52)),
+            (conditioning.body_map.convert("L"), (255, 220, 80, 48)),
+        ):
+            layer = Image.new("RGBA", frame.size, color)
+            layer.putalpha(mask.point(lambda value: int(value * (color[3] / 255.0))))
+            overlay.alpha_composite(layer)
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        draw.rectangle([8, 8, 258, 76], fill=(0, 0, 0, 150))
+        draw.text((16, 16), "LOCAL_FACE_DEFORM active", fill=(210, 255, 238, 255))
+        draw.text((16, 34), "GLOBAL_TRANSFORM disabled", fill=(210, 255, 238, 255))
+        draw.text((16, 52), f"mask {frame.height}x{frame.width} yaw {control['yaw']:.1f}", fill=(210, 255, 238, 255))
+        frame.alpha_composite(overlay)
 
     @staticmethod
     def _safe_box(left: float, top: float, right: float, bottom: float, width: int, height: int) -> tuple[int, int, int, int] | None:
@@ -492,6 +766,7 @@ class SemanticAvatarAdapter:
             "semantic_adapter_width": self.width,
             "semantic_adapter_height": self.height,
             "semantic_debug_overlay": self.debug_semantic_overlay,
+            "semantic_debug_face_mask": self.debug_face_mask,
             "semantic_conditioning_mode": "debug_overlay" if self.debug_semantic_overlay else "hidden_pre_denoise",
             "avatar_session_count": session_count,
             "active_avatar": active_session.metrics() if active_session else None,

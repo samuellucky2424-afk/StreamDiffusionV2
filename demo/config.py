@@ -29,6 +29,7 @@ class Args(NamedTuple):
     semantic_avatar_max_input_queue_frames: int
     semantic_avatar_image_format: str
     debug_semantic_overlay: bool
+    debug_face_mask: bool
     enable_metrics: bool
     target_latency: float
     t2v: bool
@@ -138,6 +139,13 @@ parser.add_argument(
     action="store_true",
     default=os.getenv("DEBUG_SEMANTIC_OVERLAY", "").lower() in {"1", "true", "yes", "on"},
     help="Render semantic maps visibly in avatar conditioning frames for debugging. Off by default.",
+)
+parser.add_argument(
+    "--debug-face-mask",
+    dest="debug_face_mask",
+    action="store_true",
+    default=os.getenv("DEBUG_FACE_MASK", "").lower() in {"1", "true", "yes", "on"},
+    help="Render localized face/body masks and semantic debug labels. Off by default.",
 )
 
 # Metrics collection
