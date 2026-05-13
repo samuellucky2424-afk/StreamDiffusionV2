@@ -14,6 +14,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 from PIL import Image, ImageOps
 
+from .semantic_adapter import SemanticAvatarAdapter
 from .semantic_metrics import SemanticAvatarMetrics
 from .semantic_renderer import EncodedFrame, latest_frame_payload
 
@@ -64,6 +65,7 @@ class VideoFrameStreamRenderer:
         width: int,
         height: int,
         metrics: SemanticAvatarMetrics,
+        adapter: SemanticAvatarAdapter | None = None,
         prompt: str | None = None,
         max_input_queue_frames: int = 8,
         max_output_frames_per_tick: int = 4,
@@ -74,6 +76,7 @@ class VideoFrameStreamRenderer:
         self.width = max(1, int(width))
         self.height = max(1, int(height))
         self.metrics = metrics
+        self.adapter = adapter
         self.prompt = prompt
         self.max_input_queue_frames = max(1, int(max_input_queue_frames))
         self.max_output_frames_per_tick = max(1, int(max_output_frames_per_tick))
@@ -84,11 +87,13 @@ class VideoFrameStreamRenderer:
         self.last_frame_bytes = 0
         self.last_decode_ms = 0.0
         self.last_input_shape = f"{self.height}x{self.width}x3"
+        self.last_identity_metrics: dict[str, Any] = {}
 
     def submit_frame(
         self,
         payload: bytes,
         *,
+        avatar_id: str | None = None,
         received_perf_t: float | None = None,
         prompt: str | None = None,
     ) -> dict[str, float | int | str | None]:
@@ -102,6 +107,7 @@ class VideoFrameStreamRenderer:
         self.metrics.adapter_latency_ms.add(decode_ms)
         self.frames_decoded += 1
         self.last_frame_bytes = len(payload)
+        image = self._apply_identity_conditioning(image, avatar_id)
 
         self._maybe_update_prompt(prompt)
         input_queue = getattr(self.pipeline, "input_queue", None)
@@ -177,7 +183,11 @@ class VideoFrameStreamRenderer:
             "video_avatar_input_shape": self.last_input_shape,
             "video_avatar_width": self.width,
             "video_avatar_height": self.height,
-            "video_avatar_conditioning_mode": "rgb_frame_pre_denoise",
+            "video_avatar_conditioning_mode": "hybrid_rgb_identity_pre_denoise"
+            if self.last_identity_metrics.get("identity_lock_active")
+            else "rgb_frame_pre_denoise",
+            "conditioning_tensor_shape": self.last_input_shape,
+            **self.last_identity_metrics,
         }
 
     def _decode_payload(self, payload: bytes) -> Image.Image:
@@ -188,6 +198,21 @@ class VideoFrameStreamRenderer:
                 method=Image.Resampling.BICUBIC,
                 centering=(0.5, 0.5),
             )
+
+    def _apply_identity_conditioning(self, image: Image.Image, avatar_id: str | None) -> Image.Image:
+        if not avatar_id or self.adapter is None or not self.adapter.identity_lock.has_identity(avatar_id):
+            self.last_identity_metrics = {
+                "video_avatar_identity_lock_active": False,
+                "video_avatar_avatar_id": avatar_id,
+            }
+            return image
+        result = self.adapter.identity_lock.condition_frame(avatar_id, image)
+        self.last_identity_metrics = {
+            **result.metrics,
+            "video_avatar_identity_lock_active": True,
+            "video_avatar_avatar_id": avatar_id,
+        }
+        return result.image
 
     @staticmethod
     def _to_array(image: Image.Image) -> np.ndarray:
@@ -245,6 +270,7 @@ def attach_video_avatar_routes(
     app: Any,
     *,
     pipeline: Any,
+    adapter: SemanticAvatarAdapter | None = None,
     width: int = 512,
     height: int = 512,
     route_config: VideoAvatarRouteConfig | None = None,
@@ -256,6 +282,7 @@ def attach_video_avatar_routes(
         width=width,
         height=height,
         metrics=metrics,
+        adapter=adapter,
         prompt=config.default_prompt,
         max_input_queue_frames=config.max_input_queue_frames,
         max_output_frames_per_tick=config.max_output_frames_per_tick,
@@ -281,6 +308,7 @@ async def _run_video_avatar_ws(
     config: VideoAvatarRouteConfig,
 ) -> None:
     prompt = websocket.query_params.get("prompt") or config.default_prompt
+    avatar_id = websocket.query_params.get("avatar_id")
     await websocket.accept()
 
     latest: bytes | None = None
@@ -354,6 +382,7 @@ async def _run_video_avatar_ws(
                         await asyncio.to_thread(
                             renderer.submit_frame,
                             frame,
+                            avatar_id=avatar_id,
                             received_perf_t=frame_received_t,
                             prompt=prompt,
                         )
@@ -374,13 +403,15 @@ async def _run_video_avatar_ws(
                     async with send_lock:
                         await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
                     LOGGER.info(
-                        "video-avatar fps in=%.2f out=%.2f queue=%s dropped=%s frame=%sB input=%s decode=%sms encode=%sms denoise=%sms stream=%sms",
+                        "video-avatar fps in=%.2f out=%.2f queue=%s dropped=%s frame=%sB input=%s identity=%s drift=%s decode=%sms encode=%sms denoise=%sms stream=%sms",
                         snapshot.get("semantic_fps") or 0.0,
                         snapshot.get("output_fps") or 0.0,
                         snapshot.get("queue_size") or 0,
                         snapshot.get("dropped_packets") or 0,
                         snapshot.get("video_avatar_last_frame_bytes") or 0,
                         snapshot.get("video_avatar_input_shape"),
+                        snapshot.get("video_avatar_identity_lock_active"),
+                        snapshot.get("identity_drift_score"),
                         snapshot.get("video_avatar_decode_ms"),
                         snapshot.get("encode_latency_ms"),
                         snapshot.get("denoise_latency_ms"),

@@ -71,6 +71,7 @@ def attach_semantic_avatar_routes(
     app.state.video_avatar_renderer = attach_video_avatar_routes(
         app,
         pipeline=pipeline,
+        adapter=adapter,
         width=width,
         height=height,
         route_config=VideoAvatarRouteConfig(
