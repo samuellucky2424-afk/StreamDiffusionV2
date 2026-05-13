@@ -215,7 +215,8 @@ class SingleGPUInferencePipeline:
         outputs: List[np.ndarray] = []
 
         for batch_idx in range(input_batch):
-            if session.current_start // self.pipeline.frame_seq_length >= self.t_refresh:
+            refresh_frame = min(self.t_refresh, max(1, self.pipeline.num_kv_cache - 1))
+            if session.current_start // self.pipeline.frame_seq_length >= refresh_frame:
                 session.current_start = self.pipeline.kv_cache_length - self.pipeline.frame_seq_length
                 session.current_end = session.current_start + (session.chunk_size // self.base_chunk_size) * self.pipeline.frame_seq_length
 
