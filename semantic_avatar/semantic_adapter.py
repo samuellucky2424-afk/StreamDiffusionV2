@@ -20,6 +20,7 @@ from typing import Any, Mapping
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
+from .semantic_face_encoder import FacialConditioning, SemanticFaceEncoder
 from .semantic_pose import SemanticPacket
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -80,6 +81,8 @@ class SemanticAvatarAdapter:
         self.lock = threading.RLock()
         self.frames_rendered = 0
         self.last_render_ms = 0.0
+        self.face_encoder = SemanticFaceEncoder()
+        self.last_conditioning_metrics: dict[str, Any] = {}
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.debug_every_n = max(0, int(debug_every_n))
         if self.debug_dir:
@@ -117,6 +120,7 @@ class SemanticAvatarAdapter:
         with self.lock:
             self.sessions[avatar_id] = session
             self.latest_avatar_id = avatar_id
+            self.face_encoder.reset()
 
         return {
             "avatar_id": avatar_id,
@@ -163,47 +167,64 @@ class SemanticAvatarAdapter:
         return array
 
     def _render_synthetic_driving_frame(self, session: PortraitSession, packet: SemanticPacket) -> Image.Image:
+        conditioning = self.face_encoder.encode(packet, (self.width, self.height))
+        self.last_conditioning_metrics = dict(conditioning.metrics)
+        control = conditioning.control
+
         base = session.image
         background = base.filter(ImageFilter.GaussianBlur(radius=14))
         background = Image.blend(background, Image.new("RGB", base.size, (20, 22, 28)), 0.34)
 
-        yaw = _clamp(packet.yaw, -45.0, 45.0)
-        pitch = _clamp(packet.pitch, -35.0, 35.0)
-        roll = _clamp(packet.roll + packet.shoulder_rotation * 0.18, -45.0, 45.0)
+        yaw = _clamp(control["yaw"], -58.0, 58.0)
+        pitch = _clamp(control["pitch"], -46.0, 46.0)
+        roll = _clamp(control["roll"] + control["neck_rotation"] * 0.10, -54.0, 54.0)
         confidence_alpha = 0.55 + packet.confidence * 0.45
 
         layer = base.convert("RGBA")
-        yaw_squash = 1.0 - abs(yaw) / 260.0
-        pitch_scale = 1.0 + abs(pitch) / 380.0
+        yaw_squash = 1.0 - abs(yaw) / 210.0
+        pitch_scale = 1.0 + abs(pitch) / 310.0
         scaled_w = max(8, int(self.width * yaw_squash))
         scaled_h = max(8, int(self.height * pitch_scale))
         layer = layer.resize((scaled_w, scaled_h), Image.Resampling.BICUBIC)
         layer = layer.rotate(roll, resample=Image.Resampling.BICUBIC, expand=True)
 
-        x = int((self.width - layer.width) * 0.5 + yaw * 0.85 + (packet.head_x - 0.5) * 46)
-        y = int((self.height - layer.height) * 0.5 + pitch * 0.42 + (packet.head_y - 0.35) * 54)
+        x = int((self.width - layer.width) * 0.5 + yaw * 1.12 + (control["head_x"] - 0.5) * 58)
+        y = int((self.height - layer.height) * 0.5 + pitch * 0.58 + (control["head_y"] - 0.35) * 68)
         alpha = layer.getchannel("A").point(lambda value: int(value * confidence_alpha))
         layer.putalpha(alpha)
 
         frame = background.convert("RGBA")
         frame.alpha_composite(layer, (x, y))
-        self._draw_expression_overlay(frame, packet)
+        self._composite_conditioning_maps(frame, conditioning, control)
+        self._draw_expression_overlay(frame, packet, control)
         return frame.convert("RGB")
 
-    def _draw_expression_overlay(self, frame: Image.Image, packet: SemanticPacket) -> None:
+    def _composite_conditioning_maps(
+        self,
+        frame: Image.Image,
+        conditioning: FacialConditioning,
+        control: dict[str, Any],
+    ) -> None:
+        strength = _clamp(0.20 + control["confidence"] * 0.18, 0.16, 0.38)
+        guide = conditioning.conditioning_image.convert("RGBA")
+        alpha = guide.convert("L").point(lambda value: int(value * strength))
+        guide.putalpha(alpha)
+        frame.alpha_composite(guide)
+
+    def _draw_expression_overlay(self, frame: Image.Image, packet: SemanticPacket, control: dict[str, Any]) -> None:
         draw = ImageDraw.Draw(frame, "RGBA")
         width, height = frame.size
-        cx = packet.head_x * width
-        cy = packet.head_y * height
+        cx = control["head_x"] * width
+        cy = control["head_y"] * height
         face_w = width * 0.34
         face_h = height * 0.42
-        eye_y = cy - face_h * 0.12 + packet.pitch * 0.35
-        mouth_y = cy + face_h * 0.22 + packet.mouth_open * height * 0.018
-        left_eye_x = cx - face_w * 0.18 + packet.eye_x * width * 0.01
-        right_eye_x = cx + face_w * 0.18 + packet.eye_x * width * 0.01
-        blink_left = _clamp(packet.blink_left or packet.blink, 0.0, 1.0)
-        blink_right = _clamp(packet.blink_right or packet.blink, 0.0, 1.0)
-        brow_lift = packet.brow * height * 0.025
+        eye_y = cy - face_h * 0.12 + control["pitch"] * 0.32
+        mouth_y = cy + face_h * 0.22 + control["mouth_open"] * height * 0.030
+        left_eye_x = cx - face_w * 0.18 + control["eye_x"] * width * 0.012
+        right_eye_x = cx + face_w * 0.18 + control["eye_x"] * width * 0.012
+        blink_left = _clamp(control["blink_left"], 0.0, 1.0)
+        blink_right = _clamp(control["blink_right"], 0.0, 1.0)
+        brow_lift = control["brow"] * height * 0.034
 
         guide_alpha = int(52 + packet.confidence * 52)
         dark = (32, 20, 26, guide_alpha + 40)
@@ -217,15 +238,15 @@ class SemanticAvatarAdapter:
                 draw.line([(x - ew, eye_y), (x + ew, eye_y)], fill=dark, width=max(2, width // 170))
             else:
                 draw.ellipse([x - ew, eye_y - eh, x + ew, eye_y + eh], outline=dark, width=max(1, width // 210))
-                pupil_x = x + packet.eye_x * ew * 0.45
-                pupil_y = eye_y + packet.eye_y * eh * 0.65
+                pupil_x = x + control["eye_x"] * ew * 0.60
+                pupil_y = eye_y + control["eye_y"] * eh * 0.85
                 draw.ellipse([pupil_x - 1.5, pupil_y - 1.5, pupil_x + 1.5, pupil_y + 1.5], fill=dark)
 
         eye(left_eye_x, blink_left)
         eye(right_eye_x, blink_right)
 
         brow_y = eye_y - face_h * 0.085 - brow_lift
-        brow_slant = packet.roll * 0.06
+        brow_slant = control["roll"] * 0.06
         draw.line(
             [(left_eye_x - face_w * 0.09, brow_y + brow_slant), (left_eye_x + face_w * 0.11, brow_y - brow_slant)],
             fill=dark,
@@ -237,30 +258,31 @@ class SemanticAvatarAdapter:
             width=max(2, width // 180),
         )
 
-        mouth_w = face_w * (0.14 + packet.smile * 0.11)
-        mouth_h = face_h * (0.018 + packet.mouth_open * 0.11)
-        if packet.mouth_open > 0.08:
+        lip_width = _clamp(control["lip_width"], 0.0, 1.0)
+        mouth_w = face_w * (0.13 + lip_width * 0.09 + control["smile"] * 0.10)
+        mouth_h = face_h * (0.016 + control["jaw_open"] * 0.18 + control["lip_separation"] * 0.08)
+        if control["mouth_open"] > 0.055:
             draw.ellipse(
                 [cx - mouth_w, mouth_y - mouth_h, cx + mouth_w, mouth_y + mouth_h],
-                fill=(78, 26, 42, guide_alpha + 58),
+                fill=(78, 20, 36, guide_alpha + 76),
                 outline=warm,
                 width=max(1, width // 240),
             )
         else:
             curve = [
                 (cx - mouth_w, mouth_y),
-                (cx - mouth_w * 0.35, mouth_y + packet.smile * face_h * 0.05),
-                (cx + mouth_w * 0.35, mouth_y + packet.smile * face_h * 0.05),
+                (cx - mouth_w * 0.35, mouth_y + control["smile"] * face_h * 0.06),
+                (cx + mouth_w * 0.35, mouth_y + control["smile"] * face_h * 0.06),
                 (cx + mouth_w, mouth_y),
             ]
             draw.line(curve, fill=dark, width=max(2, width // 190), joint="curve")
 
-        shoulder_y = packet.shoulder_y * height
+        shoulder_y = control["shoulder_y"] * height
         shoulder_span = width * (0.24 + packet.confidence * 0.08)
-        shoulder_angle = np.deg2rad(packet.shoulder_rotation + packet.roll * 0.2)
+        shoulder_angle = np.deg2rad(control["shoulder_rotation"] + control["roll"] * 0.2)
         dx = np.cos(shoulder_angle) * shoulder_span * 0.5
         dy = np.sin(shoulder_angle) * shoulder_span * 0.5
-        sx = packet.shoulder_x * width
+        sx = control["shoulder_x"] * width
         draw.line([(sx - dx, shoulder_y - dy), (sx + dx, shoulder_y + dy)], fill=cyan, width=max(2, width // 160))
 
         if packet.face_landmarks:
@@ -288,6 +310,7 @@ class SemanticAvatarAdapter:
             "semantic_adapter_height": self.height,
             "avatar_session_count": session_count,
             "active_avatar": active_session.metrics() if active_session else None,
+            **self.last_conditioning_metrics,
         }
 
 

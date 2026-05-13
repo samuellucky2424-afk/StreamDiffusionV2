@@ -65,6 +65,18 @@ def _normalize_landmarks(value: Any) -> list[tuple[float, float]]:
     return points
 
 
+def _normalize_landmark_groups(value: Any) -> list[list[tuple[float, float]]]:
+    if not isinstance(value, list):
+        return []
+    groups: list[list[tuple[float, float]]] = []
+    for item in value:
+        source = item.get("landmarks") if isinstance(item, Mapping) else item
+        points = _normalize_landmarks(source)
+        if points:
+            groups.append(points)
+    return groups
+
+
 @dataclass(slots=True)
 class SemanticPacket:
     """Normalized semantic motion packet sent by the browser.
@@ -82,8 +94,13 @@ class SemanticPacket:
     blink_left: float = 0.0
     blink_right: float = 0.0
     mouth_open: float = 0.0
+    jaw_open: float = 0.0
+    mouth_upper_lower: float = 0.0
+    lip_width: float = 0.0
+    lip_corner_stretch: float = 0.0
     brow: float = 0.0
     smile: float = 0.0
+    cheek: float = 0.0
     eye_x: float = 0.0
     eye_y: float = 0.0
     head_x: float = 0.5
@@ -92,9 +109,11 @@ class SemanticPacket:
     shoulder_y: float = 0.62
     shoulder_rotation: float = 0.0
     torso_rotation: float = 0.0
+    neck_rotation: float = 0.0
     confidence: float = 1.0
     face_landmarks: list[tuple[float, float]] = field(default_factory=list)
     pose_landmarks: list[tuple[float, float]] = field(default_factory=list)
+    hand_landmarks: list[list[tuple[float, float]]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -147,10 +166,22 @@ class SemanticPacket:
             or []
         )
         pose_landmarks = payload.get("poseLandmarks") or payload.get("pose_landmarks") or []
+        hand_landmarks = payload.get("handLandmarks") or payload.get("hand_landmarks") or payload.get("hands") or []
 
         head = _normalize_point(payload.get("headPosition"))
         head_x = head[0] if head else _pick_float(payload, "headX", "head_x", default=0.5)
         head_y = head[1] if head else _pick_float(payload, "headY", "head_y", default=0.35)
+        jaw_open = _clamp(_pick_float(payload, "jawOpen", "jaw_open", "jaw", default=0.0), 0.0, 1.0)
+        mouth_open = _clamp(
+            _pick_float(payload, "mouthOpen", "mouth_open", "mo", default=jaw_open),
+            0.0,
+            1.0,
+        )
+        neck_rotation = _clamp(
+            _pick_float(payload, "neckRotation", "neck_rotation", "nr", default=0.0),
+            -90.0,
+            90.0,
+        )
 
         return cls(
             timestamp=timestamp,
@@ -161,9 +192,22 @@ class SemanticPacket:
             blink=blink,
             blink_left=blink_left,
             blink_right=blink_right,
-            mouth_open=_clamp(_pick_float(payload, "mouthOpen", "mouth_open", "jawOpen", "jaw", "mo", default=0.0), 0.0, 1.0),
+            mouth_open=mouth_open,
+            jaw_open=jaw_open,
+            mouth_upper_lower=_clamp(
+                _pick_float(payload, "mouthUpperLower", "lipSeparation", "lipGap", "ul", default=mouth_open),
+                0.0,
+                1.0,
+            ),
+            lip_width=_clamp(_pick_float(payload, "lipWidth", "mouthWidth", "lw", default=0.0), 0.0, 1.0),
+            lip_corner_stretch=_clamp(
+                _pick_float(payload, "lipCornerStretch", "cornerStretch", "lcs", default=0.0),
+                0.0,
+                1.0,
+            ),
             brow=_clamp(_pick_float(payload, "brow", "browRaise", "brow_raise", default=0.0), 0.0, 1.0),
             smile=_clamp(_pick_float(payload, "smile", "sm", default=0.0), 0.0, 1.0),
+            cheek=_clamp(_pick_float(payload, "cheek", "cheekMovement", "cheekRaise", "ck", default=0.0), 0.0, 1.0),
             eye_x=_clamp(_pick_float(payload, "pupilX", "eyeDirectionX", "ex", default=eye_x_default), -1.0, 1.0),
             eye_y=_clamp(_pick_float(payload, "pupilY", "eyeDirectionY", "ey", default=eye_y_default), -1.0, 1.0),
             head_x=_clamp(head_x, 0.0, 1.0),
@@ -171,10 +215,12 @@ class SemanticPacket:
             shoulder_x=_clamp(shoulder_x, 0.0, 1.0),
             shoulder_y=_clamp(shoulder_y, 0.0, 1.0),
             shoulder_rotation=_clamp(_pick_float(payload, "shoulderRotation", "shoulder_rotation", "torsoAngle", "ta", default=0.0), -90.0, 90.0),
-            torso_rotation=_clamp(_pick_float(payload, "torsoRotation", "torso_rotation", "neckRotation", "nr", default=0.0), -90.0, 90.0),
+            torso_rotation=_clamp(_pick_float(payload, "torsoRotation", "torso_rotation", "ta", default=0.0), -90.0, 90.0),
+            neck_rotation=neck_rotation,
             confidence=_clamp(_pick_float(payload, "confidence", "poseConfidence", "c", default=1.0), 0.0, 1.0),
             face_landmarks=_normalize_landmarks(face_landmarks),
             pose_landmarks=_normalize_landmarks(pose_landmarks),
+            hand_landmarks=_normalize_landmark_groups(hand_landmarks),
             raw=payload,
         )
 
@@ -187,14 +233,21 @@ class SemanticPacket:
             "roll": round(self.roll, 3),
             "blink": round(self.blink, 3),
             "mouth_open": round(self.mouth_open, 3),
+            "jaw_open": round(self.jaw_open, 3),
+            "mouth_upper_lower": round(self.mouth_upper_lower, 3),
+            "lip_width": round(self.lip_width, 3),
+            "lip_corner_stretch": round(self.lip_corner_stretch, 3),
             "brow": round(self.brow, 3),
             "smile": round(self.smile, 3),
+            "cheek": round(self.cheek, 3),
             "head_x": round(self.head_x, 3),
             "head_y": round(self.head_y, 3),
             "shoulder_rotation": round(self.shoulder_rotation, 3),
+            "neck_rotation": round(self.neck_rotation, 3),
             "confidence": round(self.confidence, 3),
             "face_landmarks": len(self.face_landmarks),
             "pose_landmarks": len(self.pose_landmarks),
+            "hand_landmarks": sum(len(hand) for hand in self.hand_landmarks),
         }
 
 

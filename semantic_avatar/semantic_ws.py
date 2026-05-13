@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, TextIO
+from uuid import uuid4
 
 from fastapi import File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
@@ -108,6 +111,7 @@ async def _run_semantic_avatar_ws(
     send_lock = asyncio.Lock()
     min_interval = 1.0 / max(1, int(config.target_fps))
     last_metrics_t = perf_counter()
+    record_file, record_path = _open_recording_file(avatar_id)
 
     async def receiver() -> None:
         nonlocal latest, latest_received_t, latest_seq, session_drops
@@ -139,6 +143,8 @@ async def _run_semantic_avatar_ws(
                     continue
 
                 renderer.metrics.packet_received()
+                if record_file is not None:
+                    _record_packet(record_file, payload)
                 packet_t = payload.get("timestamp", payload.get("wallTime", payload.get("t")))
                 if isinstance(packet_t, (int, float)) and packet_t > 10_000_000:
                     renderer.metrics.websocket_rtt_ms.add(max(0.0, time.time() * 1000.0 - float(packet_t)))
@@ -198,14 +204,22 @@ async def _run_semantic_avatar_ws(
 
                 if perf_counter() - last_metrics_t >= config.metrics_interval_s:
                     snapshot = renderer.metrics_snapshot()
+                    if record_path is not None:
+                        snapshot["semantic_recording_path"] = str(record_path)
                     async with send_lock:
                         await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
                     LOGGER.info(
-                        "semantic-avatar fps in=%.2f out=%.2f queue=%s dropped=%s q_delay=%sms encode=%sms denoise=%sms decode=%sms stream=%sms",
+                        "semantic-avatar fps in=%.2f out=%.2f queue=%s dropped=%s mouth=%s blink=%s ypr=%s/%s/%s controlnet=%sms q_delay=%sms encode=%sms denoise=%sms decode=%sms stream=%sms",
                         snapshot.get("semantic_fps") or 0.0,
                         snapshot.get("output_fps") or 0.0,
                         snapshot.get("queue_size") or 0,
                         snapshot.get("dropped_packets") or 0,
+                        snapshot.get("mouth_open"),
+                        snapshot.get("blink"),
+                        snapshot.get("yaw"),
+                        snapshot.get("pitch"),
+                        snapshot.get("roll"),
+                        snapshot.get("semantic_controlnet_latency_ms"),
                         snapshot.get("queue_delay_ms"),
                         snapshot.get("encode_latency_ms"),
                         snapshot.get("denoise_latency_ms"),
@@ -224,10 +238,43 @@ async def _run_semantic_avatar_ws(
         await asyncio.gather(receiver(), render_sender())
     finally:
         LOGGER.info("semantic avatar websocket closed avatar_id=%s session_drops=%d", avatar_id, session_drops)
+        if record_file is not None:
+            record_file.close()
         try:
             await websocket.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _open_recording_file(avatar_id: str | None) -> tuple[TextIO | None, Path | None]:
+    record_dir = os.getenv("SEMANTIC_AVATAR_RECORD_DIR")
+    if not record_dir:
+        return None, None
+    try:
+        root = Path(record_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        safe_avatar = "".join(ch for ch in (avatar_id or "no-avatar") if ch.isalnum() or ch in {"-", "_"})[:40]
+        path = root / f"{time.strftime('%Y%m%d_%H%M%S')}_{safe_avatar}_{uuid4().hex[:8]}.jsonl"
+        return path.open("a", encoding="utf-8", buffering=1), path
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("semantic avatar recording could not be opened")
+        return None, None
+
+
+def _record_packet(record_file: TextIO, payload: dict[str, Any]) -> None:
+    try:
+        record_file.write(
+            json.dumps(
+                {
+                    "received_ms": int(time.time() * 1000.0),
+                    "packet": payload,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("semantic avatar recording write failed")
 
 
 __all__ = ["SemanticAvatarRouteConfig", "attach_semantic_avatar_routes"]
