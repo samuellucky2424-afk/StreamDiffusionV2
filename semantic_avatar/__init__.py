@@ -1,6 +1,8 @@
 """Semantic conditioning adapters for StreamDiffusionV2."""
 
 from .adapter import SemanticPoseConditioningAdapter
+from .face_expression_encoder import ExpressionConditioning, FaceExpressionEncoder
+from .identity_lock import IdentityConditioningResult, IdentityEmbedding, IdentityLock
 from .schema import SemanticPacket as LegacySemanticPacket
 from .semantic_adapter import PortraitSession, SemanticAvatarAdapter
 from .semantic_face_encoder import FacialConditioning, SemanticFaceEncoder
@@ -12,7 +14,12 @@ from .semantic_ws import SemanticAvatarRouteConfig, attach_semantic_avatar_route
 
 __all__ = [
     "LegacySemanticPacket",
+    "ExpressionConditioning",
     "FacialConditioning",
+    "FaceExpressionEncoder",
+    "IdentityConditioningResult",
+    "IdentityEmbedding",
+    "IdentityLock",
     "MouthFeatures",
     "PortraitSession",
     "PipelineQueueSemanticRenderer",

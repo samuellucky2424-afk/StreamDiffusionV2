@@ -22,6 +22,8 @@ SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES="${SEMANTIC_AVATAR_MAX_INPUT_QUEUE_FRAMES
 SEMANTIC_AVATAR_IMAGE_FORMAT="${SEMANTIC_AVATAR_IMAGE_FORMAT:-JPEG}"
 DEBUG_SEMANTIC_OVERLAY="${DEBUG_SEMANTIC_OVERLAY:-0}"
 DEBUG_FACE_MASK="${DEBUG_FACE_MASK:-0}"
+DEBUG_IDENTITY="${DEBUG_IDENTITY:-0}"
+DEBUG_CONDITIONING="${DEBUG_CONDITIONING:-0}"
 
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
 LOCAL_GPU_IDS="$(seq 0 $((${#GPU_ARRAY[@]} - 1)) | paste -sd, -)"
@@ -67,6 +69,20 @@ case "$(printf '%s' "$DEBUG_FACE_MASK" | tr '[:upper:]' '[:lower:]')" in
     ;;
 esac
 
+DEBUG_IDENTITY_FLAG=""
+case "$(printf '%s' "$DEBUG_IDENTITY" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on)
+    DEBUG_IDENTITY_FLAG="--debug-identity"
+    ;;
+esac
+
+DEBUG_CONDITIONING_FLAG=""
+case "$(printf '%s' "$DEBUG_CONDITIONING" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on)
+    DEBUG_CONDITIONING_FLAG="--debug-conditioning"
+    ;;
+esac
+
 CUDA_VISIBLE_DEVICES="$GPU_IDS" python main.py \
   --port "$PORT" \
   --host "$HOST" \
@@ -81,6 +97,8 @@ CUDA_VISIBLE_DEVICES="$GPU_IDS" python main.py \
   --semantic-avatar-image-format "$SEMANTIC_AVATAR_IMAGE_FORMAT" \
   $DEBUG_SEMANTIC_OVERLAY_FLAG \
   $DEBUG_FACE_MASK_FLAG \
+  $DEBUG_IDENTITY_FLAG \
+  $DEBUG_CONDITIONING_FLAG \
   $TAEHV_FLAG \
   $TENSORRT_FLAG \
   $FAST_FLAG

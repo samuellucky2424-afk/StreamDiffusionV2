@@ -30,6 +30,8 @@ class Args(NamedTuple):
     semantic_avatar_image_format: str
     debug_semantic_overlay: bool
     debug_face_mask: bool
+    debug_identity: bool
+    debug_conditioning: bool
     enable_metrics: bool
     target_latency: float
     t2v: bool
@@ -146,6 +148,20 @@ parser.add_argument(
     action="store_true",
     default=os.getenv("DEBUG_FACE_MASK", "").lower() in {"1", "true", "yes", "on"},
     help="Render localized face/body masks and semantic debug labels. Off by default.",
+)
+parser.add_argument(
+    "--debug-identity",
+    dest="debug_identity",
+    action="store_true",
+    default=os.getenv("DEBUG_IDENTITY", "").lower() in {"1", "true", "yes", "on"},
+    help="Render identity-lock debug labels and expose identity metrics. Off by default.",
+)
+parser.add_argument(
+    "--debug-conditioning",
+    dest="debug_conditioning",
+    action="store_true",
+    default=os.getenv("DEBUG_CONDITIONING", "").lower() in {"1", "true", "yes", "on"},
+    help="Render hidden conditioning debug labels and expose tensor metrics. Off by default.",
 )
 
 # Metrics collection

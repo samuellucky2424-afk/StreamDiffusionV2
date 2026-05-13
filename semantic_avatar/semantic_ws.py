@@ -33,6 +33,8 @@ class SemanticAvatarRouteConfig:
     default_prompt: str | None = None
     debug_semantic_overlay: bool = False
     debug_face_mask: bool = False
+    debug_identity: bool = False
+    debug_conditioning: bool = False
 
 
 def attach_semantic_avatar_routes(
@@ -52,6 +54,8 @@ def attach_semantic_avatar_routes(
         height=height,
         debug_semantic_overlay=config.debug_semantic_overlay,
         debug_face_mask=config.debug_face_mask,
+        debug_identity=config.debug_identity,
+        debug_conditioning=config.debug_conditioning,
     )
     renderer = PipelineQueueSemanticRenderer(
         pipeline=pipeline,
@@ -216,7 +220,7 @@ async def _run_semantic_avatar_ws(
                     async with send_lock:
                         await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
                     LOGGER.info(
-                        "semantic-avatar fps in=%.2f out=%.2f queue=%s dropped=%s mouth=%s blink=%s ypr=%s/%s/%s controlnet=%sms q_delay=%sms encode=%sms denoise=%sms decode=%sms stream=%sms",
+                        "semantic-avatar fps in=%.2f out=%.2f queue=%s dropped=%s mouth=%s blink=%s ypr=%s/%s/%s identity_drift=%s expr=%s controlnet=%sms q_delay=%sms encode=%sms denoise=%sms decode=%sms stream=%sms",
                         snapshot.get("semantic_fps") or 0.0,
                         snapshot.get("output_fps") or 0.0,
                         snapshot.get("queue_size") or 0,
@@ -226,6 +230,8 @@ async def _run_semantic_avatar_ws(
                         snapshot.get("yaw"),
                         snapshot.get("pitch"),
                         snapshot.get("roll"),
+                        snapshot.get("identity_drift_score"),
+                        snapshot.get("face_expression_tensor_shape"),
                         snapshot.get("semantic_controlnet_latency_ms"),
                         snapshot.get("queue_delay_ms"),
                         snapshot.get("encode_latency_ms"),

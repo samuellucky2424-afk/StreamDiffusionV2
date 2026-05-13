@@ -122,6 +122,8 @@ class App:
                 default_prompt=getattr(self.pipeline, "prompt", None),
                 debug_semantic_overlay=bool(self.args.debug_semantic_overlay),
                 debug_face_mask=bool(self.args.debug_face_mask),
+                debug_identity=bool(self.args.debug_identity),
+                debug_conditioning=bool(self.args.debug_conditioning),
             ),
         )
 

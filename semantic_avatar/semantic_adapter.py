@@ -20,6 +20,8 @@ from typing import Any, Mapping
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
+from .face_expression_encoder import FaceExpressionEncoder
+from .identity_lock import IdentityLock
 from .semantic_face_encoder import (
     FACE_OVAL,
     LEFT_BROW,
@@ -59,6 +61,7 @@ class PortraitSession:
     height: int = 512
     frames_rendered: int = 0
     last_packet: SemanticPacket | None = None
+    identity_cached: bool = False
 
     def metrics(self) -> dict[str, float | int | str | None]:
         return {
@@ -68,6 +71,7 @@ class PortraitSession:
             "width": self.width,
             "height": self.height,
             "frames_rendered": self.frames_rendered,
+            "identity_cached": self.identity_cached,
             "last_packet": self.last_packet.to_debug_dict() if self.last_packet else None,
         }
 
@@ -84,6 +88,8 @@ class SemanticAvatarAdapter:
         debug_every_n: int = 0,
         debug_semantic_overlay: bool = False,
         debug_face_mask: bool = False,
+        debug_identity: bool = False,
+        debug_conditioning: bool = False,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -93,9 +99,13 @@ class SemanticAvatarAdapter:
         self.frames_rendered = 0
         self.last_render_ms = 0.0
         self.face_encoder = SemanticFaceEncoder()
+        self.expression_encoder = FaceExpressionEncoder()
+        self.identity_lock = IdentityLock()
         self.last_conditioning_metrics: dict[str, Any] = {}
         self.debug_semantic_overlay = bool(debug_semantic_overlay)
         self.debug_face_mask = bool(debug_face_mask)
+        self.debug_identity = bool(debug_identity)
+        self.debug_conditioning = bool(debug_conditioning)
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.debug_every_n = max(0, int(debug_every_n))
         if self.debug_dir:
@@ -109,6 +119,8 @@ class SemanticAvatarAdapter:
         *,
         debug_semantic_overlay: bool | None = None,
         debug_face_mask: bool | None = None,
+        debug_identity: bool | None = None,
+        debug_conditioning: bool | None = None,
     ) -> "SemanticAvatarAdapter":
         if debug_semantic_overlay is None:
             debug_semantic_overlay = os.getenv("SEMANTIC_AVATAR_DEBUG_OVERLAY", "").lower() in {
@@ -124,6 +136,20 @@ class SemanticAvatarAdapter:
                 "yes",
                 "on",
             }
+        if debug_identity is None:
+            debug_identity = os.getenv("SEMANTIC_AVATAR_DEBUG_IDENTITY", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if debug_conditioning is None:
+            debug_conditioning = os.getenv("SEMANTIC_AVATAR_DEBUG_CONDITIONING", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         return cls(
             width=width,
             height=height,
@@ -131,6 +157,8 @@ class SemanticAvatarAdapter:
             debug_every_n=int(os.getenv("SEMANTIC_AVATAR_DEBUG_EVERY_N", "0") or "0"),
             debug_semantic_overlay=debug_semantic_overlay,
             debug_face_mask=debug_face_mask,
+            debug_identity=debug_identity,
+            debug_conditioning=debug_conditioning,
         )
 
     def upload_portrait(self, filename: str, payload: bytes) -> dict[str, Any]:
@@ -153,16 +181,21 @@ class SemanticAvatarAdapter:
             width=self.width,
             height=self.height,
         )
+        identity_embedding = self.identity_lock.cache_portrait(avatar_id, image)
+        session.identity_cached = True
         with self.lock:
             self.sessions[avatar_id] = session
             self.latest_avatar_id = avatar_id
             self.face_encoder.reset()
+            self.expression_encoder.reset()
 
         return {
             "avatar_id": avatar_id,
             "width": self.width,
             "height": self.height,
             "filename": session.filename,
+            "identity_lock": True,
+            "identity_embedding_dim": int(identity_embedding.vector.shape[0]),
         }
 
     def get_session(self, avatar_id: str | None = None) -> PortraitSession:
@@ -206,13 +239,33 @@ class SemanticAvatarAdapter:
         conditioning = self.face_encoder.encode(packet, (self.width, self.height))
         self.last_conditioning_metrics = dict(conditioning.metrics)
         control = conditioning.control
+        expression = self.expression_encoder.encode(packet, control, conditioning_shape=conditioning.shape)
+        self.last_conditioning_metrics.update(expression.metrics)
 
         frame = self._deform_portrait(session.image, packet, control).convert("RGBA")
+        identity_result = self.identity_lock.condition_frame(
+            session.avatar_id,
+            frame.convert("RGB"),
+            expression_vector=expression.vector,
+        )
+        frame = identity_result.image.convert("RGBA")
+        self.last_conditioning_metrics.update(identity_result.metrics)
+        self.last_conditioning_metrics.update(
+            {
+                "identity_payload_shape": f"1x{identity_result.metrics.get('identity_embedding_dim')}",
+                "identity_embedding_shape": f"1x{identity_result.metrics.get('identity_embedding_dim')}",
+                "identity_conditioning_payload_active": bool(identity_result.metrics.get("identity_lock_active")),
+                "debug_identity": self.debug_identity,
+                "debug_conditioning": self.debug_conditioning,
+            }
+        )
         if self.debug_semantic_overlay:
             self._composite_conditioning_maps(frame, conditioning, control)
             self._draw_expression_overlay(frame, packet, control)
         if self.debug_face_mask:
             self._draw_face_mask_debug(frame, conditioning, control)
+        if self.debug_identity or self.debug_conditioning:
+            self._draw_conditioning_debug(frame)
         return frame.convert("RGB")
 
     def _deform_portrait(self, image: Image.Image, packet: SemanticPacket, control: dict[str, Any]) -> Image.Image:
@@ -241,6 +294,10 @@ class SemanticAvatarAdapter:
                 "controlnet_conditioning_active": True,
                 "controlnet_model_active": False,
                 "controlnet_maps_active": True,
+                "human_controlnet_conditioning_active": True,
+                "openpose_upper_body_conditioning_active": True,
+                "face_mesh_conditioning_active": bool(packet.face_landmarks),
+                "hand_conditioning_active": bool(packet.hand_landmarks),
                 "face_mask_resolution": f"{height}x{width}",
                 "face_mask_regions": ",".join(sorted(masks)),
             }
@@ -625,6 +682,23 @@ class SemanticAvatarAdapter:
         draw.text((16, 52), f"mask {frame.height}x{frame.width} yaw {control['yaw']:.1f}", fill=(210, 255, 238, 255))
         frame.alpha_composite(overlay)
 
+    def _draw_conditioning_debug(self, frame: Image.Image) -> None:
+        metrics = self.last_conditioning_metrics
+        overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        width = frame.width
+        draw.rounded_rectangle([8, 84, min(width - 8, 292), 178], radius=8, fill=(0, 0, 0, 156))
+        lines = [
+            f"IDENTITY_LOCK {str(metrics.get('identity_lock_active')).lower()}",
+            f"drift {metrics.get('identity_drift_score')} cache {metrics.get('temporal_cache_usage')}",
+            f"expr {metrics.get('face_expression_tensor_shape')} motion {metrics.get('face_expression_motion_energy')}",
+            f"latent {metrics.get('latent_identity_conditioning_active')} controlnet {metrics.get('controlnet_maps_active')}",
+            f"cross-attn {metrics.get('cross_attention_identity_conditioning_active')}",
+        ]
+        for index, line in enumerate(lines):
+            draw.text((16, 94 + index * 16), line, fill=(214, 255, 236, 255))
+        frame.alpha_composite(overlay)
+
     @staticmethod
     def _safe_box(left: float, top: float, right: float, bottom: float, width: int, height: int) -> tuple[int, int, int, int] | None:
         box = (
@@ -767,9 +841,12 @@ class SemanticAvatarAdapter:
             "semantic_adapter_height": self.height,
             "semantic_debug_overlay": self.debug_semantic_overlay,
             "semantic_debug_face_mask": self.debug_face_mask,
+            "semantic_debug_identity": self.debug_identity,
+            "semantic_debug_conditioning": self.debug_conditioning,
             "semantic_conditioning_mode": "debug_overlay" if self.debug_semantic_overlay else "hidden_pre_denoise",
             "avatar_session_count": session_count,
             "active_avatar": active_session.metrics() if active_session else None,
+            **self.identity_lock.metrics(),
             **self.last_conditioning_metrics,
         }
 
